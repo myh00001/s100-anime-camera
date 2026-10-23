@@ -1,41 +1,44 @@
-"""Two independent Python interpreters, at most two fresh frames in flight.
+"""N independent Python interpreters, at most K main BPU chains in flight.
 
-The native CPU path releases the next frame after scene inference; the
-portable path retains the last-face structure gate.
-This fills inter-model CPU gaps without unbounded BPU task accumulation.
+Same scheduling idea as the original (latest frame only, bounded in-flight work,
+ordered output), generalised:
+  RAC_WORKERS  number of worker processes (default 2 = original)
+  RAC_INFLIGHT max frames admitted before the previous one reached its CPU tail (default 1 = original)
+  RAC_PRESCALE resize to <=1280 in the parent before pickling (identical math, 2.25x less IPC for 1080p)
+  RAC_THREADS  cv2 threads per worker (default 4 = original)
 """
 import multiprocessing as mp
+import os
 import queue
 import time
 from pathlib import Path
 
+WORKERS = int(os.environ.get('RAC_WORKERS', '2'))
+INFLIGHT = int(os.environ.get('RAC_INFLIGHT', '1'))
+PRESCALE = os.environ.get('RAC_PRESCALE', '1') == '1'
 
-def render_worker(slot, tasks, events, release_stage='structure'):
+
+def prescale(frame):
+    import cv2
+    scale = min(1, 1280 / max(frame.shape[:2]))
+    return cv2.resize(frame, None, fx=scale, fy=scale) if scale < 1 else frame
+
+
+def render_worker(slot, tasks, events):
     import sys
     root = Path(__file__).resolve().parent
     sys.path.insert(0, str(root / 'vendor'))
     import cv2
     from board_engine import BoardCamera
-    from display_settings import DEFAULT_SETTINGS, prepare_frame, output_dimensions
     camera = BoardCamera()
-    camera.scene_size = max(DEFAULT_SETTINGS['width'],DEFAULT_SETTINGS['height'])
-    if release_stage in ('structure', 'anime', 'scene'):
-        key = {'structure': 'portrait_v2_512', 'anime': 'portrait_anime', 'scene': 'scene'}[release_stage]
-        original_runner = camera.trt[key]
-
-        def signal_after_stage(value):
-            result = original_runner(value)
-            if release_stage == 'scene' or getattr(camera, '_remaining_faces', -1) == 0:
-                camera.on_bpu_chain_done()
-            return result
-
-        camera.trt[key] = signal_after_stage
+    cv2.setNumThreads(int(os.environ.get('RAC_THREADS', '4')))
+    camera.scene_size = 960
     events.put(('init', slot))
     while True:
         task = tasks.get()
         if task is None:
             return
-        seq, frame, submitted, settings = task
+        seq, frame, submitted = task
         signaled = False
 
         def ready():
@@ -46,29 +49,17 @@ def render_worker(slot, tasks, events, release_stage='structure'):
 
         camera.on_bpu_chain_done = ready
         try:
-            if settings is None:
-                scale = min(1, 1280 / max(frame.shape[:2]))
-                small = cv2.resize(frame, None, fx=scale, fy=scale) if scale < 1 else frame
-            else:
-                small = prepare_frame(frame, settings)
-                camera.scene_size = max(settings['width'], settings['height'])
+            small = prescale(frame)  # no-op when the parent already prescaled
             begin = time.perf_counter()
             rgb = camera.render(cv2.cvtColor(small, cv2.COLOR_BGR2RGB))
             processing_ms = (time.perf_counter() - begin) * 1000
-            if settings is not None:
-                size = output_dimensions(small.shape[1], small.shape[0], max(settings['width'], settings['height']))
-                if (rgb.shape[1], rgb.shape[0]) != size:
-                    rgb = cv2.resize(rgb, size, interpolation=cv2.INTER_CUBIC)
-            if settings is None or settings['mirror']:
-                rgb = cv2.flip(rgb, 1)
+            rgb = cv2.flip(rgb, 1)
             metrics = {
                 'processing_ms': processing_ms,
                 'latency_ms': (time.perf_counter() - submitted) * 1000,
                 'faces': int(camera.last_face_stats.get('refined', 0)),
                 'detected_faces': int(camera.last_face_stats.get('detected', 0)),
                 'capture_sequence': seq,
-                'settings': settings,
-                'release_stage': release_stage,
             }
             ready()
             events.put(('done', slot, seq, rgb, metrics))
@@ -77,23 +68,18 @@ def render_worker(slot, tasks, events, release_stage='structure'):
             events.put(('error', slot, seq, repr(exc)))
 
 
-def run_pipeline(latest, running, release_stage=None, configuration=None):
-    """Yield ordered completed frames; latest() returns (camera_sequence, BGR)."""
-    if release_stage is None:
-        from native_math import AVAILABLE
-        release_stage = 'scene' if AVAILABLE else 'structure'
+def run_pipeline(latest, running):
+    """Yield ordered completed frames; latest() returns (camera_sequence, BGR[, capture_time])."""
     ctx = mp.get_context('spawn')
-    events = ctx.Queue(maxsize=8)
-    tasks = [ctx.Queue(maxsize=1) for _ in range(2)]
-    if release_stage not in ('parser', 'anime', 'structure', 'scene', 'ungated'):
-        raise ValueError('Unsupported BPU release stage')
-    workers = [ctx.Process(target=render_worker, args=(i, tasks[i], events, release_stage), daemon=True) for i in range(2)]
+    events = ctx.Queue(maxsize=8 + 2 * WORKERS)
+    tasks = [ctx.Queue(maxsize=1) for _ in range(WORKERS)]
+    workers = [ctx.Process(target=render_worker, args=(i, tasks[i], events), daemon=True) for i in range(WORKERS)]
     try:
         for worker in workers:
             worker.start()
         initialized = set()
-        deadline = time.monotonic() + 90
-        while running() and len(initialized) < 2:
+        deadline = time.monotonic() + 120
+        while running() and len(initialized) < WORKERS:
             if time.monotonic() > deadline:
                 raise RuntimeError('BPU workers did not initialize')
             if any(p.exitcode is not None for p in workers):
@@ -105,8 +91,7 @@ def run_pipeline(latest, running, release_stage=None, configuration=None):
             if event[0] == 'init':
                 initialized.add(event[1])
         busy = set()
-        next_slot = 0
-        can_submit = True
+        gated = set()          # slots admitted whose BPU chain has not finished yet
         previous = displayed = -1
         progress = time.monotonic()
         while running():
@@ -114,26 +99,29 @@ def run_pipeline(latest, running, release_stage=None, configuration=None):
                 raise RuntimeError('BPU worker exited')
             if busy and time.monotonic() - progress > 30:
                 raise RuntimeError('BPU worker stalled')
-            if can_submit and next_slot not in busy:
-                seq, frame = latest()
+            free = [s for s in range(WORKERS) if s not in busy]
+            if free and len(gated) < INFLIGHT:
+                got = latest()
+                seq, frame = got[0], got[1]
+                stamp = got[2] if len(got) > 2 else time.perf_counter()
                 if frame is not None and seq != previous:
                     previous = seq
-                    settings = dict(configuration()) if configuration is not None else None
-                    tasks[next_slot].put((seq, frame, time.perf_counter(), settings))
-                    busy.add(next_slot)
-                    next_slot = 1 - next_slot
-                    can_submit = release_stage == 'ungated'
+                    slot = free[0]
+                    tasks[slot].put((seq, prescale(frame) if PRESCALE else frame, stamp))
+                    busy.add(slot)
+                    gated.add(slot)
                     progress = time.monotonic()
             try:
-                event = events.get(timeout=.01)
+                event = events.get(timeout=.005)
             except queue.Empty:
                 continue
             progress = time.monotonic()
             kind, slot, seq = event[:3]
             if kind == 'stage':
-                can_submit = True
+                gated.discard(slot)
             elif kind in ('done', 'error'):
                 busy.discard(slot)
+                gated.discard(slot)
                 if kind == 'error':
                     print('INFERENCE_WORKER', event[3], flush=True)
                 elif seq > displayed:

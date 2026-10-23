@@ -1,72 +1,74 @@
 from pathlib import Path
-import concurrent.futures
 import cv2
 import numpy as np
 from face_tracking import FaceContinuity
-from native_math import sharpen_exact
 ROOT=Path(__file__).resolve().parent
 class AnimeCamera:
 
     def __init__(self):
         self.scene_size = 640
-        self._analysis_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self.previous_source = self.previous_output = None
         self.use_tracking = self.use_temporal = False
         self.face_continuity = FaceContinuity()
         self.last_face_stats = {}
         cv2.setNumThreads(4)
-        self.detector = cv2.FaceDetectorYN.create(str(ROOT / 'models/face_detection_yunet_2023mar.onnx'), '', (480, 480), 0.65, 0.3, 2000)
+        import os as _os
+        self.detector = None
+        if _os.environ.get('RAC_FACE', '0') == '1':
+            self.detector = cv2.FaceDetectorYN.create(str(ROOT / 'models/face_detection_yunet_2023mar.onnx'), '', (480, 480), 0.65, 0.3, 2000)
 
     def face_mask(self, crop, refined):
         yy, xx = np.mgrid[0:512, 0:512]
         radius = ((xx - 256) / 195) ** 2 + ((yy - 260) / 235) ** 2
         return np.clip((1 - radius) * 6, 0, 1).astype(np.float32)
 
-    def analyze_source(self, rgb, size):
-        ow, oh = size
-        source = cv2.resize(rgb, (ow, oh), interpolation=cv2.INTER_AREA) if self.use_tracking or self.use_temporal else None
+    def render(self, rgb):
+        h, w = rgb.shape[:2]
+        self._scene_request = True
+        try:
+            out = self.generate(rgb, self.scene_size)
+        finally:
+            self._scene_request = False
+        oh, ow = out.shape[:2]
+        source = cv2.resize(rgb, (ow, oh), interpolation=cv2.INTER_AREA)
+        import os as _os
+        if _os.environ.get('RAC_FACE', '0') != '1':
+            gray = cv2.cvtColor(source, cv2.COLOR_RGB2GRAY)
+            self.last_face_stats = {'detected': 0, 'tracked': 0, 'refined': 0, 'input_sharpness': round(float(cv2.Laplacian(gray, cv2.CV_32F).var()), 2), 'face_mode': 'off'}
+            face_coverage = np.zeros((oh, ow), np.float32)
+            self._remaining_faces = 0
+            if getattr(self, 'on_bpu_chain_done', None):
+                self.on_bpu_chain_done()
+            self.current_face_coverage = face_coverage
+            detail = out.astype(np.float32) - cv2.GaussianBlur(out.astype(np.float32), (0, 0), 0.75)
+            out = np.clip(out.astype(np.float32) * 0.98 + 4 + detail * 0.22, 0, 255).astype(np.uint8)
+            if self.use_temporal and self.previous_source is not None and (self.previous_source.shape == source.shape):
+                change = np.max(np.abs(source.astype(np.float32) - self.previous_source.astype(np.float32)), axis=2)
+                change = cv2.dilate(change, np.ones((7, 7), np.uint8))
+                disagreement = np.max(np.abs(out.astype(np.float32) - self.previous_output.astype(np.float32)), axis=2)
+                weight = np.clip(1 - change / 9, 0, 1) * np.clip(1 - disagreement / 22, 0, 1) * 0.25
+                out = np.uint8(out.astype(np.float32) * (1 - weight[..., None]) + self.previous_output * weight[..., None])
+            self.previous_source = source.copy()
+            self.previous_output = out.copy()
+            return out
         detect_scale = 480 / max(ow, oh)
         dw, dh = (round(ow * detect_scale), round(oh * detect_scale))
         px, py = ((480 - dw) // 2, (480 - dh) // 2)
         detect = np.zeros((480, 480, 3), dtype=np.uint8)
         detect[py:py + dh, px:px + dw] = cv2.resize(rgb, (dw, dh), interpolation=cv2.INTER_AREA)
         _, faces = self.detector.detect(cv2.cvtColor(detect, cv2.COLOR_RGB2BGR))
-        gray = cv2.cvtColor(source if source is not None else rgb, cv2.COLOR_RGB2GRAY)
-        sharpness = round(float(cv2.Laplacian(gray, cv2.CV_32F).var()), 2)
-        return source, gray, faces, detect_scale, px, py, sharpness
-
-    def render(self, rgb):
-        h, w = rgb.shape[:2]
-        predicted_size = (max(32, round(w * self.scene_size / max(w, h) / 4) * 4),
-                          max(32, round(h * self.scene_size / max(w, h) / 4) * 4))
-        analysis = self._analysis_pool.submit(self.analyze_source, rgb, predicted_size)
-        self._scene_request = True
-        try:
-            out = self.generate(rgb, self.scene_size)
-        except BaseException:
-            try:
-                analysis.result()
-            except Exception:
-                pass
-            raise
-        finally:
-            self._scene_request = False
-        oh, ow = out.shape[:2]
-        if (ow, oh) != predicted_size:
-            analysis.result()
-            raise RuntimeError('Detector prefetch size mismatch')
-        source, gray, faces, detect_scale, px, py, sharpness = analysis.result()
         landmarks = []
         head_boxes = []
         if faces is not None:
             ordered = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)[:3]
             landmarks = [(face[4:14].reshape(5, 2) - np.array([px, py])) / detect_scale for face in ordered]
             head_boxes = [np.r_[(face[:2] - np.array([px, py])) / detect_scale, face[2:4] / detect_scale] for face in ordered]
+        gray = cv2.cvtColor(source, cv2.COLOR_RGB2GRAY)
         if self.use_tracking:
             points_list, tracked = self.face_continuity.update(gray, landmarks)
         else:
             points_list, tracked = (landmarks, 0)
-        self.last_face_stats = {'detected': len(landmarks), 'tracked': tracked, 'refined': 0, 'input_sharpness': sharpness}
+        self.last_face_stats = {'detected': len(landmarks), 'tracked': tracked, 'refined': 0, 'input_sharpness': round(float(cv2.Laplacian(gray, cv2.CV_32F).var()), 2)}
         face_coverage = np.zeros((oh, ow), np.float32)
         self._remaining_faces = len(points_list)
         if not points_list and getattr(self, 'on_bpu_chain_done', None):
@@ -115,9 +117,8 @@ class AnimeCamera:
                 face_coverage[y0:y1,x0:x1]=np.maximum(face_coverage[y0:y1,x0:x1],mask[:,:,0])
                 out[y0:y1,x0:x1]=np.uint8(out[y0:y1,x0:x1].astype(np.float32)*(1-mask)+restored*mask)
                 self.last_face_stats['refined'] += 1
-        floating = out.astype(np.float32)
-        detail = cv2.GaussianBlur(floating, (0, 0), 0.75)
-        out = sharpen_exact(floating, detail)
+        detail = out.astype(np.float32) - cv2.GaussianBlur(out.astype(np.float32), (0, 0), 0.75)
+        out = np.clip(out.astype(np.float32) * 0.98 + 4 + detail * 0.22, 0, 255).astype(np.uint8)
         if self.use_temporal and self.previous_source is not None and (self.previous_source.shape == source.shape):
             change = np.max(np.abs(source.astype(np.float32) - self.previous_source.astype(np.float32)), axis=2)
             change = cv2.dilate(change, np.ones((7, 7), np.uint8))
@@ -126,6 +127,6 @@ class AnimeCamera:
             weight *= 1 - face_coverage
             out = np.uint8(out.astype(np.float32) * (1 - weight[..., None]) + self.previous_output * weight[..., None])
         self.current_face_coverage = face_coverage
-        self.previous_source = source.copy() if self.use_temporal else None
-        self.previous_output = out.copy() if self.use_temporal else None
+        self.previous_source = source.copy()
+        self.previous_output = out.copy()
         return out
