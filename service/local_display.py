@@ -1,6 +1,6 @@
 """USB capture on S100, latest-frame inference, GTK fullscreen display."""
 from pathlib import Path
-import sys,threading,time,json,re,subprocess,urllib.request
+import os,sys,threading,time,json,re,subprocess,urllib.request
 from collections import deque
 from resource_monitor import ResourceMonitor,corner_action
 from display_settings import DEFAULT_SETTINGS,load_settings,save_settings,cover_geometry,output_dimensions
@@ -253,8 +253,12 @@ class Player:
     if m and size:candidates.append((size[0]*size[1],float(m[1]),fmt,size))
    if candidates:
     _,fps,fmt,(w,h)=max(candidates,key=lambda x:(x[0],x[1],x[2]=='MJPG'))
-    cap.set(cv2.CAP_PROP_FOURCC,cv2.VideoWriter_fourcc(*fmt));cap.set(cv2.CAP_PROP_FRAME_WIDTH,w);cap.set(cv2.CAP_PROP_FRAME_HEIGHT,h);cap.set(cv2.CAP_PROP_FPS,fps)
-   cap.set(cv2.CAP_PROP_BUFFERSIZE,1)
+    if fmt=='MJPG' and os.environ.get('RAC_HWDEC','1')=='1':
+     from fast_capture import HwMjpegCapture
+     cap.release();cap=HwMjpegCapture(device,w,h,fps)
+    else:
+     cap.set(cv2.CAP_PROP_FOURCC,cv2.VideoWriter_fourcc(*fmt));cap.set(cv2.CAP_PROP_FRAME_WIDTH,w);cap.set(cv2.CAP_PROP_FRAME_HEIGHT,h);cap.set(cv2.CAP_PROP_FPS,fps)
+     cap.set(cv2.CAP_PROP_BUFFERSIZE,1)
    self.capture_info={'device':str(device),'width':cap.get(3),'height':cap.get(4),'fps':cap.get(5)}
    print('CAPTURE',json.dumps(self.capture_info),flush=True)
    while self.running:
@@ -279,7 +283,7 @@ class Player:
      now=time.monotonic();self.frame_times.append(now)
      while len(self.frame_times)>2 and self.frame_times[0]<now-3:self.frame_times.popleft()
      fps=(len(self.frame_times)-1)/(now-self.frame_times[0]) if len(self.frame_times)>1 else 1000/max(metrics['latency_ms'],1)
-     self.message='';status={'frames':count,'fps':fps,'fps_window_seconds':3,'capture':self.capture_info,'output':[output.shape[1],output.shape[0]],'mirror':self.settings['mirror'],'display_mode':'cover','backend':'S100 BPU','pipeline':'two-process-gated'}
+     self.message='';status={'frames':count,'fps':fps,'fps_window_seconds':3,'capture':self.capture_info,'output':[output.shape[1],output.shape[0]],'mirror':self.settings['mirror'],'display_mode':'cover','backend':'S100 BPU','pipeline':f"{os.environ.get('RAC_WORKERS','2')}-process-gated-{os.environ.get('RAC_INFLIGHT','1')}"}
      status.update(metrics);self.frame_status=status
      if count%10==1:
       (ROOT/'local-display-status.json').write_text(json.dumps(status,indent=2));print('DISPLAY',json.dumps(status),flush=True)

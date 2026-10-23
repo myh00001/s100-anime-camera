@@ -1,11 +1,8 @@
-import concurrent.futures
-from native_math import quarter_blend_exact
+import os
 import cv2
 import numpy as np
 from board_base import AnimeCamera,ROOT
 from hbm_runner import HbmRunner
-from image_math import normalized_pixels,decoded_pixels_owned,luminance_lut
-from display_settings import DEFAULT_SETTINGS
 _LABEL_TABLES = {}
 _YY, _XX = np.mgrid[:512, :512].astype(np.float32)
 
@@ -17,6 +14,12 @@ def luminance_percentiles(values):
     upper = np.ceil(indices).astype(int)
     lo, hi = np.searchsorted(cdf, lower + 1), np.searchsorted(cdf, upper + 1)
     return lo + (hi - lo) * (indices - lower)
+
+def fast_argmax(chw):
+    """np.argmax over channels, returned as uint8 so label_in() takes its lookup-table path
+    instead of np.isin on int64 (identical labels)."""
+    a = chw.argmax(axis=0)
+    return a.astype(np.uint8) if os.environ.get('RAC_FAST_ARGMAX', '1') == '1' else a
 
 def label_in(labels, ids):
     if labels.dtype != np.uint8:
@@ -31,14 +34,53 @@ class BoardCamera(AnimeCamera):
 
     def __init__(self):
         super().__init__()
-        self._source_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        cv2.setNumThreads(6)
-        self.scene_size = max(DEFAULT_SETTINGS['width'],DEFAULT_SETTINGS['height'])
         self.face_detail_fallbacks = self.stable_faces = 0
         self.alignment_template = np.float32([[192.98138, 239.94708], [318.90277, 240.1936], [256.63416, 314.01935], [201.26117, 371.41043], [313.08905, 371.15118]])
-        self.trt = {key: HbmRunner(ROOT / 'models' / file) for key, file in {'portrait_v2_512': 'portrait_structure_512.hbm', 'portrait_anime': 'portrait_anime_512.hbm', 'scene': 'scene_640.hbm', 'parser': 'head_parse_512.hbm'}.items()}
+        self.trt = {}
+        self.ort_structure = None
+        self.ort_parser = None
+        self._ort_structure_path = None
+        self._ort_parser_path = None
+        face_on = os.environ.get('RAC_FACE', '0') == '1'
+        # Scene always; face models only when RAC_FACE=1. ORT lazy for missing structure/parser HBM.
+        model_keys = {'scene': 'scene_640.hbm'}
+        if face_on:
+            model_keys.update({'portrait_anime': 'portrait_anime_512.hbm', 'parser': 'head_parse_512.hbm', 'portrait_v2_512': 'portrait_structure_512.hbm'})
+        for key, file in model_keys.items():
+            path = ROOT / 'models' / file
+            if path.exists():
+                self.trt[key] = HbmRunner(path)
+            elif key == 'portrait_v2_512':
+                onnx = ROOT / 'models' / 'portrait_structure_512.onnx'
+                if not onnx.exists():
+                    raise FileNotFoundError(f'missing {file} and {onnx}')
+                self._ort_structure_path = onnx
+                print('ORT_STRUCTURE_LAZY', onnx, flush=True)
+            elif key == 'parser':
+                onnx = ROOT / 'models' / 'head_parse_512.onnx'
+                if not onnx.exists():
+                    raise FileNotFoundError(f'missing {file} and {onnx}')
+                self._ort_parser_path = onnx
+                print('ORT_PARSER_LAZY', onnx, flush=True)
+            else:
+                raise FileNotFoundError(path)
+        print('RAC_FACE', '1' if face_on else '0', 'models', list(self.trt), flush=True)
         self._portrait_labels = None
         self.trt_calls = self.ort_calls = self.torch_calls = 0
+
+    def _ensure_ort_structure(self):
+        if self.ort_structure is None and self._ort_structure_path is not None:
+            import onnxruntime as ort
+            so = ort.SessionOptions(); so.intra_op_num_threads = int(__import__('os').environ.get('RAC_ORT_THREADS', '2'))
+            self.ort_structure = ort.InferenceSession(str(self._ort_structure_path), so, providers=['CPUExecutionProvider'])
+            print('ORT_STRUCTURE', self._ort_structure_path, flush=True)
+
+    def _ensure_ort_parser(self):
+        if self.ort_parser is None and self._ort_parser_path is not None:
+            import onnxruntime as ort
+            so = ort.SessionOptions(); so.intra_op_num_threads = int(__import__('os').environ.get('RAC_ORT_THREADS', '2'))
+            self.ort_parser = ort.InferenceSession(str(self._ort_parser_path), so, providers=['CPUExecutionProvider'])
+            print('ORT_PARSER', self._ort_parser_path, flush=True)
 
     def run_ghibli(self, x):
         self.trt_calls += 1
@@ -56,10 +98,18 @@ class BoardCamera(AnimeCamera):
         return cv2.resize(y, (w, h), interpolation=cv2.INTER_CUBIC)[None]
 
     def parse_labels(self, image, size=512):
-        x = normalized_pixels(image).transpose(2, 0, 1)[None]
-        self.trt_calls += 1
-        logits = self.trt['parser'](x)[0]
-        labels = logits[0].astype(np.uint8) if logits.ndim == 3 else logits.argmax(axis=1)[0]
+        x = (image.astype(np.float32) / 127.5 - 1).transpose(2, 0, 1)[None]
+        if 'parser' in self.trt:
+            self.trt_calls += 1
+            logits = self.trt['parser'](x)[0]
+        elif self._ort_parser_path is not None or self.ort_parser is not None:
+            self._ensure_ort_parser()
+            self.ort_calls += 1
+            iname = self.ort_parser.get_inputs()[0].name
+            logits = self.ort_parser.run(None, {iname: np.ascontiguousarray(x, dtype=np.float32)})[0]
+        else:
+            raise RuntimeError('no parser HBM/ORT')
+        labels = logits[0].astype(np.uint8) if logits.ndim == 3 else fast_argmax(logits[0])
         if getattr(self, '_remaining_faces', -1) == 0 and getattr(self, 'on_bpu_chain_done', None):
             self.on_bpu_chain_done()
         return labels
@@ -112,17 +162,23 @@ class BoardCamera(AnimeCamera):
 
     def generate(self, rgb, size):
         if size == 512 and rgb.shape[:2] == (512, 512) and (not getattr(self, '_scene_request', False)):
+            x = (rgb.astype(np.float32) / 127.5 - 1).transpose(2, 0, 1)[None]
             if 'portrait_v2_512' in self.trt:
                 self.trt_calls += 1
-                x = normalized_pixels(rgb).transpose(2, 0, 1)[None]
                 y = self.trt['portrait_v2_512'](x)[0][0].transpose(1, 2, 0)
-                out = decoded_pixels_owned(y)
+            elif self._ort_structure_path is not None or self.ort_structure is not None:
+                self._ensure_ort_structure()
+                self.ort_calls += 1
+                y = self.ort_structure.run(None, {'input': np.ascontiguousarray(x, dtype=np.float32)})[0][0].transpose(1, 2, 0)
             else:
                 self.torch_calls += 1
                 out = super().generate(rgb, 512)
-            x = normalized_pixels(out)[None]
+                y = None
+            if y is not None:
+                out = np.uint8(np.clip((y + 1) * 127.5, 0, 255))
+            x = out[None].astype(np.float32) / 127.5 - 1
             y = self.run_ghibli(x)[0]
-            out = decoded_pixels_owned(y)
+            out = np.uint8(np.clip((y + 1) * 127.5, 0, 255))
             if out.shape[:2] != (512, 512):
                 out = cv2.resize(out, (512, 512), interpolation=cv2.INTER_CUBIC)
             out = cv2.resize(cv2.bilateralFilter(cv2.resize(out, (256, 256), interpolation=cv2.INTER_AREA), 5, 55, 3.5), (512, 512), interpolation=cv2.INTER_LINEAR)
@@ -176,9 +232,9 @@ class BoardCamera(AnimeCamera):
         nw, nh = (max(32, round(w * size / max(w, h) / 4) * 4), max(32, round(h * size / max(w, h) / 4) * 4))
         small = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_AREA)
         padded = cv2.copyMakeBorder(small, 0, -nh % 8, 0, -nw % 8, cv2.BORDER_REFLECT_101)
-        x = normalized_pixels(padded)[None]
+        x = padded[None].astype(np.float32) / 127.5 - 1
         y = self.run_ghibli(x)[0, :nh, :nw]
-        out = decoded_pixels_owned(y)
+        out = np.clip((y + 1) * 127.5, 0, 255).astype(np.uint8)
         return out
 
     def render_partial(self, rgb):
@@ -192,64 +248,25 @@ class BoardCamera(AnimeCamera):
         self.last_face_stats['backend'] = 'S100 BPU'
         return generated, self.current_face_coverage
 
-    @staticmethod
-    def prepare_source_lab(rgb, size):
-        source = cv2.resize(rgb, size, interpolation=cv2.INTER_AREA)
-        source = cv2.bilateralFilter(source, 5, 24, 4)
-        return cv2.cvtColor(source, cv2.COLOR_RGB2LAB)
-
     def render(self, rgb):
-        # The previous render joined its source future before returning.
-        # Change OpenCV's process-wide pool only at this quiet frame boundary.
-        # First frames and frames following a detected face keep six threads;
-        # background-only work benefits from fewer competing CPU threads.
-        desired_threads = 6 if self.last_face_stats.get('detected', 1) else 3
-        if cv2.getNumThreads() != desired_threads:
-            cv2.setNumThreads(desired_threads)
-        h, w = rgb.shape[:2]
-        size = (max(32, round(w * self.scene_size / max(w, h) / 4) * 4),
-                max(32, round(h * self.scene_size / max(w, h) / 4) * 4))
-        future = self._source_pool.submit(self.prepare_source_lab, rgb, size)
-        try:
-            generated, coverage = self.render_partial(rgb)
-            source_lab = future.result()
-        except BaseException:
-            future.result()
-            raise
-        if source_lab.shape[:2] != generated.shape[:2]:
-            raise RuntimeError('Prefetched source size differs from generated size')
-        return self.finish_render(rgb, generated, coverage, source_lab)
+        generated, coverage = self.render_partial(rgb)
+        return self.finish_render(rgb, generated, coverage)
 
     @staticmethod
-    def finish_render(rgb, generated, coverage, source_lab=None):
+    def finish_render(rgb, generated, coverage):
         h, w = generated.shape[:2]
-        if source_lab is None:
-            source = cv2.resize(rgb, (w, h), interpolation=cv2.INTER_AREA)
-            source = cv2.bilateralFilter(source, 5, 24, 4)
-            source_lab = cv2.cvtColor(source, cv2.COLOR_RGB2LAB)
-        lab = cv2.cvtColor(generated, cv2.COLOR_RGB2LAB)
-        original = source_lab
-        light_channel = lab[:, :, 0].copy()
-        # Quarter weights are exact in binary. CV_32F preserves the original
-        # float result; cast afterwards to truncate, rather than rounding to u8.
-        lab = quarter_blend_exact(lab, original)
-        histogram = cv2.calcHist([light_channel], [0], None, [256], [0, 256]).ravel().astype(np.int64)
-        cdf = histogram.cumsum()
-        indices = (light_channel.size - 1) * np.array([0.02, 0.98])
-        lower, upper = np.floor(indices).astype(int), np.ceil(indices).astype(int)
-        lo, hi = np.searchsorted(cdf, lower + 1), np.searchsorted(cdf, upper + 1)
-        low, high = lo + (hi - lo) * (indices - lower)
+        source = cv2.resize(rgb, (w, h), interpolation=cv2.INTER_AREA)
+        source = cv2.bilateralFilter(source, 5, 24, 4)
+        lab = cv2.cvtColor(generated, cv2.COLOR_RGB2LAB).astype(np.float32)
+        original = cv2.cvtColor(source, cv2.COLOR_RGB2LAB).astype(np.float32)
+        lab[:, :, 1:] = lab[:, :, 1:] * 0.25 + original[:, :, 1:] * 0.75
+        low, high = luminance_percentiles(lab[:, :, 0])
         if high - low > 40:
-            # The source L channel is uint8: evaluate the existing float32
-            # expression for its 256 possible values, then apply it exactly.
-            light_channel = cv2.LUT(light_channel, luminance_lut(low, high))
-        lab[:, :, 0] = light_channel
-        out = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+            light = np.clip((lab[:, :, 0] - low) * 224 / (high - low) + 16, 0, 255)
+            lab[:, :, 0] = lab[:, :, 0] * 0.35 + light * 0.65
+        out = cv2.cvtColor(np.uint8(np.clip(lab, 0, 255)), cv2.COLOR_LAB2RGB)
         gray = cv2.cvtColor(out, cv2.COLOR_RGB2GRAY)
         edges = cv2.Canny(cv2.GaussianBlur(gray, (3, 3), 0.55), 75, 150)
-        # Canny emits only 0 or 255. Non-edge pixels are unchanged, so avoid
-        # three full-resolution float images for this sparse operation.
-        ys, xs = np.nonzero(edges)
-        strength = 0.3 * (1 - 0.85 * coverage[ys, xs])
-        out[ys, xs] = np.uint8(np.clip(out[ys, xs].astype(np.float32) * (1 - strength[:, None]), 0, 255))
+        strength = 0.3 * (1 - 0.85 * coverage)
+        out = np.clip(out.astype(np.float32) * (1 - edges[:, :, None].astype(np.float32) / 255 * strength[:, :, None]), 0, 255).astype(np.uint8)
         return out
